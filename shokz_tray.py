@@ -562,7 +562,7 @@ class TrayIcon:
 
     def __init__(self, on_activate, on_menu):
         self.on_activate, self.on_menu = on_activate, on_menu
-        self.icon = "shokz-tray-hc-nodongle-symbolic"
+        self.icon = "shokz-tray-hd-nodongle-symbolic"
         self.label, self.title, self.tooltip = "", "Shokz", ""
         self.items: list[tuple[int, dict]] = []
         self.revision = 1
@@ -1198,12 +1198,12 @@ class ShokzTrayApp(Adw.Application):
         ready = st["state"] == "ready"
         bat, eq = h.get("battery"), h.get("eq")
         if st["state"] in ("no_dongle", "no_access"):
-            icon = "shokz-tray-hc-nodongle-symbolic"
+            icon = "shokz-tray-hd-nodongle-symbolic"
         elif not ready or bat is None:
-            icon = "shokz-tray-hc-disconnected-symbolic"
+            icon = "shokz-tray-hd-disconnected-symbolic"
         else:
             muted = "-muted" if mic["muted"] else ""
-            icon = f"shokz-tray-hc-{min(100, max(0, round(bat / 10) * 10)):03d}{muted}-symbolic"
+            icon = f"shokz-tray-hd-{min(100, max(0, round(bat / 10) * 10)):03d}{muted}-symbolic"
         header = {
             "ready": f"OpenComm2 · {bat} %" if bat is not None else "OpenComm2",
             "connecting": "Connexion au casque…",

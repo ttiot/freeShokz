@@ -6,17 +6,20 @@ from pathlib import Path
 ICONS = Path(__file__).resolve().parent / "icons"
 OUT = ICONS / "hicolor" / "scalable"
 
+# Formes pleines uniquement : pour une icône -symbolic, GNOME Shell force « fill » (!important)
+# sur tous les rect/path et ignore stroke. Un contour (fill="none" + stroke) y deviendrait un aplat
+# plein, qui masque la jauge. Le cadre est donc un anneau (evenodd), l'arceau une couronne.
 SYMBOLIC = """<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-<g fill="#2e3436" stroke="#2e3436"{dim}>
-  <path d="M1 8.5V7.5a7 7 0 0 1 14 0v1" fill="none" stroke-width="1.4" stroke-linecap="round"/>
-  <rect x="0" y="8" width="2.2" height="7" rx="1" stroke="none"/>
-  <rect x="13.8" y="8" width="2.2" height="7" rx="1" stroke="none"/>
-  <rect x="3.5" y="6.5" width="9" height="9" rx="1.5" fill="none" stroke-width="1"/>
+<g fill="#2e3436"{dim}>
+  <path d="M0.3 8.5V7.5a7.7 7.7 0 0 1 15.4 0v1h-1.4v-1a6.3 6.3 0 0 0-12.6 0v1z"/>
+  <rect x="0" y="8" width="2.2" height="7" rx="1"/>
+  <rect x="13.8" y="8" width="2.2" height="7" rx="1"/>
+  <path fill-rule="evenodd" d="M5 6h6a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z
+    M5 7a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V8a1 1 0 0 0-1-1z"/>
 </g>
 {extra}
 </svg>
 """
-
 
 def gauge(level: int) -> str:
     """Remplissage horizontal, calé sur la grille avec 1 px de liseré (x 5 -> 11, y 8 -> 14)."""
@@ -27,8 +30,9 @@ def gauge(level: int) -> str:
     return f'<rect x="5" y="8" width="{w:.2f}" height="6" rx="0.5"{cls}/>'
 
 
-SLASH = '<path d="M1.5 1.5l13 13" stroke="#2e3436" stroke-width="1.6" stroke-linecap="round"/>'
-# micro coupé : barre pleine (pas un trait) pour que la recoloration symbolique .error s'applique
+SLASH = ('<rect x="-0.5" y="7.2" width="17" height="1.6" rx="0.8" transform="rotate(45 8 8)"'
+         ' fill="#2e3436"/>')
+# micro coupé : même barre, en couleur d'erreur
 MUTED = ('<rect x="-0.5" y="7.1" width="17" height="1.8" rx="0.9" transform="rotate(45 8 8)"'
          ' class="error" fill="#cc0000"/>')
 
@@ -61,13 +65,13 @@ def main():
         old.unlink()  # noms versionnés : on purge les anciennes générations
     apps.mkdir(parents=True, exist_ok=True)
     for level in range(0, 101, 10):
-        (status / f"shokz-tray-hc-{level:03d}-symbolic.svg").write_text(
+        (status / f"shokz-tray-hd-{level:03d}-symbolic.svg").write_text(
             SYMBOLIC.format(dim="", extra=gauge(level)))
-        (status / f"shokz-tray-hc-{level:03d}-muted-symbolic.svg").write_text(
+        (status / f"shokz-tray-hd-{level:03d}-muted-symbolic.svg").write_text(
             SYMBOLIC.format(dim="", extra=gauge(level) + MUTED))
-    (status / "shokz-tray-hc-disconnected-symbolic.svg").write_text(
+    (status / "shokz-tray-hd-disconnected-symbolic.svg").write_text(
         SYMBOLIC.format(dim=' opacity="0.45"', extra=""))
-    (status / "shokz-tray-hc-nodongle-symbolic.svg").write_text(
+    (status / "shokz-tray-hd-nodongle-symbolic.svg").write_text(
         SYMBOLIC.format(dim=' opacity="0.45"', extra=SLASH))
     (apps / "org.shokzctl.Tray.svg").write_text(APP_ICON)
     # copie à plat : résolue par IconThemePath / add_search_path sans index.theme
