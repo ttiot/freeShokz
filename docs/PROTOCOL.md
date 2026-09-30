@@ -356,13 +356,14 @@ la valeur voulue (`02 00 00` puis `02 04 00` garantit un micro coupé).
 | Couleur | État |
 |---|---|
 | Bleu | par défaut |
-| Vert | micro utilisé (flux de capture ouvert sur la carte son du dongle) |
-| Rouge | micro coupé par la perche, flux de capture ouvert |
+| Vert fixe | micro utilisé (flux de capture ouvert), **ou** LED Off-Hook posée par l'hôte |
+| Vert clignotant | LED Ring posée par l'hôte (appel entrant) |
+| Rouge | micro coupé (perche ou LED Mute), flux de capture ouvert |
 
-La LED ne dépend pas de l'hôte. Pendant un appel Teams (PWA Chrome), aucun report HID n'a été
-envoyé au dongle, et la LED est passée au vert au démarrage du flux de capture. Elle est passée au
-rouge au mute par la perche. L'effet propre de la LED Off-Hook sur la couleur n'est pas isolé :
-pendant l'appel simulé, la capture était aussi ouverte.
+Le vert fixe a deux sources indépendantes. Pendant un appel Teams (PWA Chrome), aucun report HID
+n'a été envoyé au dongle, et la LED est passée au vert au démarrage du flux de capture. Pendant
+l'appel entrant simulé, sans capture ouverte, c'est la LED Off-Hook seule qui l'a fait passer au
+vert. Le rouge suit le mute du casque, que l'hôte ait envoyé la LED Mute ou non.
 
 ### Rôle des boutons ✅
 
@@ -372,6 +373,9 @@ pendant l'appel simulé, la capture était aussi ouverte.
 | Volume − | local | Vol− → `KEY_VOLUMEDOWN` | idem | idem |
 | Perche micro | local | rien vers le PC | mute local + invite + LED rouge + impulsion Mute → `KEY_MICMUTE` | **mute local du micro** + invite « Mute on/off » + impulsion Mute |
 | Côté du casque | local | **Play/Pause** → `KEY_PLAYPAUSE` | `02 00` (Hook reste à 0, aucun event evdev) | **raccrocher** : Hook 1 → 0, bip |
+
+Pendant une sonnerie (LED Ring posée), le bouton de côté **décroche** : Hook 0 → 1 (`02 02`),
+avec un double bip. ✅
 
 Détails observés :
 
@@ -392,8 +396,24 @@ Détails observés :
   après le dernier client), le casque rétablit son micro sans invite et la LED repasse au bleu. ✅
 - **Hook Switch** : le noyau ne le traduit en aucune touche evdev. Il faut lire le report `0x02`
   sur le hidraw.
-- **Entrée en appel** : dès que l'hôte pose Off-Hook, le casque répond `02 02` (Hook = 1), puis
-  envoie de lui-même deux Vol+.
+- **Entrée en appel** : dès que l'hôte pose Off-Hook, le casque répond `02 02` (Hook = 1) s'il
+  n'était pas déjà décroché, puis applique son volume d'appel par des touches Vol± (voir plus
+  bas).
+- **Volume d'appel** : voir [Volume automatique en appel](#volume-automatique-en-appel).
+- **Appel entrant** : la LED Ring fait clignoter le dongle en vert, mais **le casque ne sonne
+  pas**, même avec le bit Ringer (`02 88 00`). La sonnerie doit être jouée en audio par le
+  softphone. Déroulé complet observé :
+  1. l'hôte pose Ring (`02 08 00`) : le dongle clignote en vert ;
+  2. appui court sur le côté : `02 02` (décrocher), double bip ;
+  3. l'hôte pose Off-Hook sans Ring (`02 01 00`) : vert fixe, volume d'appel appliqué ;
+  4. appui court sur le côté : `02 00` (raccrocher), bip simple ;
+  5. l'hôte efface tout (`02 00 00`) : bleu, volume d'avant l'appel restauré.
+- **Appelant qui raccroche** : l'hôte efface Ring sans passer par Off-Hook. Le casque répond
+  `02 00`, et le volume ne bouge pas.
+- **Pas de rejet** : pendant la sonnerie, un appui long de 2 s n'envoie rien. Un appui de 4 s et
+  un double appui envoient tous deux `02 02`, c'est-à-dire décrocher : le premier sans bip, le
+  second avec un double bip. Aucun geste ne rejette l'appel, qui doit donc être rejeté côté
+  hôte.
 - **Raccrocher** : le casque envoie `02 00`. Si l'hôte ne remet pas la LED Off-Hook à 0, le
   casque repasse à `02 02` environ 2 s plus tard.
 - **Distinguer les boutons en mode communication** : l'impulsion Mute est `02 01` suivi ~8 ms plus
@@ -404,4 +424,52 @@ Détails observés :
   le bouton de côté.
 - **GNOME** traite `KEY_MICMUTE` en mettant en muet la source par défaut. Si ce n'est pas le
   dongle, c'est le mauvais micro qui est coupé (observé : micro interne mis en muet).
-- L'appel entrant (LED Ring, décrochage par le bouton de côté) n'a pas été testé.
+
+### Volume automatique en appel ✅
+
+Le casque mémorise un **volume d'appel**, distinct du volume média. Il l'impose à l'hôte en
+entrant dans un appel, puis restaure le volume d'avant l'appel en sortant. Il n'a aucun accès
+direct au volume du PC : il **envoie des touches Vol+/Vol−** (report `0x01`, environ 20 ms
+d'écart) et observe le résultat, c'est-à-dire le volume que l'hôte écrit sur la carte son du
+dongle (`SET_CUR`, `PCM Playback Volume` 0–45).
+
+| Moment | Ce que fait le casque |
+|---|---|
+| Off-Hook 0 → 1 | mémorise le volume courant de l'hôte (volume « d'avant ») et envoie des touches jusqu'à atteindre le volume d'appel |
+| pendant l'appel | tout changement de volume, par l'hôte ou par ses boutons, devient le nouveau volume d'appel |
+| fin d'appel | envoie des touches jusqu'à retrouver le volume d'avant, dans les deux sens au besoin |
+
+- **Fin d'appel** : Off-Hook 1 → 0, mais seulement une fois le micro fermé. Tant qu'une capture
+  reste ouverte sur le dongle, la restauration attend, puis part environ 50 ms après la
+  fermeture effective du PCM (quelques secondes après le dernier client PipeWire).
+- **Boucle fermée** : si l'hôte n'applique pas la touche (touche capturée, volume ALSA déjà à 0),
+  le casque s'arrête après une seule touche. Sous GNOME, un cran vaut 6 % du sink.
+- **Dépassement** : la boucle s'arrête au premier cran qui atteint ou franchit la cible. Le
+  volume d'appel mémorisé est le niveau réellement atteint, donc il peut dériver d'un cran par
+  appel.
+- **Mémoire dans le casque** : le volume d'appel survit au débranchement du dongle.
+- **Sans effet** : la LED Ring, le bit Ringer et un micro ouvert sans Off-Hook (Teams web, par
+  exemple) ne déclenchent rien.
+
+Mesures (volume sink / `PCM Playback Volume`, volume d'appel initial ≈ 39) :
+
+| Départ | Entrée | Sortie | Arrivée |
+|---|---|---|---|
+| 0.10 / 0 | +1, sans effet sur l'ALSA : arrêt | aucune | 0.16 / 0 |
+| 0.30 / 14 | +8 → 0.78 / 39 | −8 | 0.30 / 14 |
+| 0.50 / 27 | +5 → 0.80 / 40 | −5 | 0.50 / 27 |
+| 0.70 / 36 | +2 → 0.82 / 40 | −2 | 0.70 / 36 |
+| 0.90 / 43 | −2 → 0.78 / 39 | +2 | 0.90 / 43 |
+| 1.00 / 45 | −4 → 0.76 / 38 | +4 | 1.00 / 45 |
+| 0.50, hôte à 0.30 pendant l'appel | +4 → 0.74 | +4 (remonte) | 0.54 / 29 |
+
+**Course au démarrage** : un appel lancé dans les quelques secondes qui suivent la mise sous
+tension du dongle se passe mal. Le casque entre en appel, raccroche tout seul (Hook 1 → 0), et le
+volume peut finir à 0. Avec 20 s d'attente, tout est normal. Un unbind/bind USB, qui ne coupe pas
+l'alimentation, ne provoque pas ce problème.
+
+**Non résolu** : une fois, une sortie d'appel a envoyé 10 × Vol− au lieu de restaurer, et le
+volume a fini à 0. C'était 5 minutes après un rebranchement, lors d'un appel entrant décroché au
+bouton. Aucune des reproductions n'a redonné ce résultat : Ring, Ringer, décroché ou raccroché
+au bouton, 30 s sans acquittement, rebranchement.
+
