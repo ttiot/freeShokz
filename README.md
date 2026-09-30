@@ -175,9 +175,23 @@ Par défaut, `/dev/hidraw*` n'est accessible qu'à root. La règle
 session active** (ACL via `TAG+="uaccess"`), et **uniquement à l'interface 0** du dongle :
 
 ```udev
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3511", ATTRS{idProduct}=="2ef2", ATTRS{bInterfaceNumber}=="00", TAG+="uaccess", MODE="0660", GROUP="plugdev"
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3511", ATTRS{idProduct}=="2f06", ATTRS{bInterfaceNumber}=="00", TAG+="uaccess", MODE="0660", GROUP="plugdev"
+ACTION=="remove", GOTO="shokz_loop120_end"
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="3511", GOTO="shokz_loop120"
+GOTO="shokz_loop120_end"
+
+LABEL="shokz_loop120"
+ENV{ID_USB_INTERFACE_NUM}!="?*", IMPORT{builtin}="usb_id"
+ENV{ID_USB_MODEL_ID}!="2ef2|2f06", GOTO="shokz_loop120_end"
+ENV{ID_USB_INTERFACE_NUM}!="00", GOTO="shokz_loop120_end"
+
+TAG+="uaccess", MODE="0660", GROUP="plugdev"
+
+LABEL="shokz_loop120_end"
 ```
+
+Le filtre sur l'interface passe par `usb_id` : udev exige que tous les `ATTRS{}` d'une règle
+correspondent sur le même parent, et `idVendor` (périphérique USB) et `bInterfaceNumber`
+(interface) sont portés par deux nœuds différents.
 
 L'interface 1 (usage page `0xFF00`) sert aux mises à jour firmware. Elle reste réservée à root
 par choix, pour qu'aucun programme utilisateur ne puisse y écrire par erreur.
