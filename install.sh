@@ -68,7 +68,7 @@ install_udev() {
     info "installation de la règle udev (sudo requis)"
     sudo install -m 0644 "$SRC/udev/70-shokz-loop120.rules" "$UDEV_RULE"
     sudo udevadm control --reload
-    sudo udevadm trigger --subsystem-match=hidraw
+    sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=input
 }
 
 write_desktop() {  # $1 = fichier, $2 = arguments Exec, $3 = lignes supplémentaires

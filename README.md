@@ -43,8 +43,12 @@ batterie, égaliseur, appareils appairés et informations du casque.
 
   *De gauche à droite : 100, 80, 60, 40, 20 et 10 %, casque non connecté, dongle absent.*
 
-- **Menu rapide** au clic droit : bascule de l'égaliseur, ouverture du panneau, actualisation,
-  sortie.
+- **Suivi du micro** : l'icône prend une barre rouge et le panneau affiche « Micro coupé »
+  quand le bouton de la perche coupe le micro du casque. Le menu permet aussi de couper ou de
+  rétablir le micro, et le casque suit (invite vocale, LED rouge du dongle). Détails dans
+  [Micro du casque](#micro-du-casque).
+- **Menu rapide** au clic droit : micro, bascule de l'égaliseur, ouverture du panneau,
+  actualisation, sortie.
 - **Panneau détaillé** au clic gauche :
   - bandeau produit et jauge de batterie ;
   - choix de l'égaliseur ;
@@ -173,10 +177,12 @@ python3 shokz_tray.py        # les icônes sont générées au premier lancement
 Par défaut, `/dev/hidraw*` n'est accessible qu'à root. La règle
 [`udev/70-shokz-loop120.rules`](udev/70-shokz-loop120.rules) donne accès **à l'utilisateur de la
 session active** (ACL via `TAG+="uaccess"`), et **uniquement à l'interface 0** du dongle :
+son hidraw, et ses devices evdev (touches média et `KEY_MICMUTE`, voir
+[Micro du casque](#micro-du-casque)) :
 
 ```udev
 ACTION=="remove", GOTO="shokz_loop120_end"
-SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="3511", GOTO="shokz_loop120"
+SUBSYSTEM=="hidraw|input", KERNEL=="hidraw*|event*", ATTRS{idVendor}=="3511", GOTO="shokz_loop120"
 GOTO="shokz_loop120_end"
 
 LABEL="shokz_loop120"
@@ -184,7 +190,8 @@ ENV{ID_USB_INTERFACE_NUM}!="?*", IMPORT{builtin}="usb_id"
 ENV{ID_USB_MODEL_ID}!="2ef2|2f06", GOTO="shokz_loop120_end"
 ENV{ID_USB_INTERFACE_NUM}!="00", GOTO="shokz_loop120_end"
 
-TAG+="uaccess", MODE="0660", GROUP="plugdev"
+TAG+="uaccess"
+SUBSYSTEM=="hidraw", MODE="0660", GROUP="plugdev"
 
 LABEL="shokz_loop120_end"
 ```
@@ -201,7 +208,7 @@ par choix, pour qu'aucun programme utilisateur ne puisse y écrire par erreur.
 ```bash
 sudo install -m 0644 udev/70-shokz-loop120.rules /etc/udev/rules.d/
 sudo udevadm control --reload
-sudo udevadm trigger --subsystem-match=hidraw
+sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=input
 ```
 
 Pour vérifier : `getfacl /dev/hidrawN` (le nœud dont le `HID_NAME` contient « Loop120 ») doit
@@ -229,6 +236,29 @@ Options de `shokz-tray` :
 | `SHOKZ_TRAY_LABEL=1` | Affiche aussi le pourcentage en texte à côté de l'icône |
 | `SHOKZ_TRAY_ANONYMIZE=1` | Masque adresses et noms d'appareils (captures d'écran) |
 | `SHOKZ_TRAY_SNAPSHOT=/tmp/x.png` | Enregistre un rendu PNG de la fenêtre (débogage) |
+| `SHOKZ_TRAY_MIC_SYNC=0` | N'écrit plus la LED Mute du dongle et laisse `KEY_MICMUTE` à GNOME : le tray se contente d'afficher l'état du micro (à utiliser si un softphone pilote déjà le casque en HID) |
+
+### Micro du casque
+
+Le casque coupe son micro **lui-même** quand on appuie sur le bouton de la perche : il annonce
+« Mute on », et la LED du dongle passe du vert (micro utilisé) au rouge. Il ne l'expose pas
+au PC. Il envoie seulement une impulsion, identique pour couper et pour rétablir, et uniquement
+quand une application utilise le micro. Il le rétablit sans prévenir à la fermeture du micro.
+
+Le tray reconstitue donc l'état, et le rend fiable :
+
+- il compte les impulsions et remet à zéro quand plus aucune application n'utilise le micro ;
+- après chaque changement, il réécrit la LED Mute du dongle, et le dongle impose alors cet état
+  au casque. Si une impulsion a été ratée, le casque est recalé au prochain appui au lieu de
+  rester décalé jusqu'à la fin de l'appel ;
+- lancé pendant un appel, il ne peut pas connaître l'état du casque : **il coupe le micro par
+  précaution** (le casque annonce « Mute on ») ;
+- il prend l'exclusivité de la touche `KEY_MICMUTE` du dongle. Sans ça, GNOME couperait la
+  *source par défaut*, qui n'est pas forcément le micro du casque.
+
+Teams en version web (PWA Chrome) ne pilote pas le casque en HID sous Linux : son bouton
+« Muet » coupe dans l'appli seulement, et le casque ne le voit pas. Il vaut mieux utiliser la
+perche, ou le menu du tray.
 
 ### Ligne de commande
 
@@ -261,7 +291,7 @@ eq                 standard
 | `shokzctl info` | État du dongle et de la liaison avec le casque |
 | `shokzctl get <param>` / `get all` | Lit un paramètre du casque (`all` = ceux que gère l'OpenComm2) |
 | `shokzctl set eq {standard,vocal}` | Change l'égaliseur |
-| `shokzctl listen` | Affiche en direct les notifications du dongle et du casque |
+| `shokzctl listen` | Affiche en direct les notifications du dongle et du casque, et les boutons |
 | `shokzctl raw-get 0x17` | `get` brut sur un `tag2` (exploration) |
 | `-v` | Affiche les trames envoyées et reçues en hexadécimal |
 
@@ -280,6 +310,8 @@ lui sont pas destinées.
 | L'icône n'apparaît pas | Extension AppIndicator inactive : `gnome-extensions enable ubuntu-appindicators@ubuntu.com` (ou `appindicatorsupport@rgcjonas.gmail.com`). |
 | Rien au survol de l'icône | Normal : l'extension GNOME n'affiche pas les infobulles. Le pourcentage figure en tête du menu. |
 | Le texte à côté de l'icône s'affiche « … » | Certains thèmes ou extensions de barre tronquent les labels des indicateurs. D'où leur désactivation par défaut (`SHOKZ_TRAY_LABEL=1` pour les remettre). |
+| L'icône indique « micro coupé » alors que le casque est actif (ou l'inverse) | Appuyer sur la perche : le tray recale le casque sur son état, puis l'appui suivant bascule normalement. Quitter l'appel remet aussi tout à zéro. |
+| Le bouton de la perche coupe aussi le micro interne dans GNOME | Exclusivité de `KEY_MICMUTE` impossible : règle udev pas à jour (relancer `./install.sh`), ou `SHOKZ_TRAY_MIC_SYNC=0`. Le journal le signale au démarrage. |
 | Journal | Quitter l'icône, puis lancer `shokz-tray --debug` dans un terminal. |
 
 ---
@@ -290,6 +322,7 @@ lui sont pas destinées.
  PC ── USB HID (interface 0) ──► Loop120 ── Bluetooth / SPP ──► OpenComm2
       reports 0x12/0x13 : dongle
       reports 0x14/0x15 : casque (relayés par le dongle)
+      reports 0x01/0x02 : boutons et LED (HID standard Consumer / Telephony)
 ```
 
 - Chaque commande est une trame `A5 5A` suivie d'un en-tête, d'un CRC-16/MAXIM et d'un TLV

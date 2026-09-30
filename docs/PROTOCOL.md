@@ -38,7 +38,9 @@ Sous Linux, l'interface 0 correspond à un nœud `/dev/hidrawN`. On l'identifie 
 
 ### Report IDs de l'interface 0
 
-Chaque report fait 255 octets. Les noms sont ceux de l'enum `PackageMessageReportId` de l'appli.
+Les reports `0x10` à `0x15` font 255 octets (`0x16`/`0x17` : 128 octets, non utilisés). Les noms
+sont ceux de l'enum `PackageMessageReportId` de l'appli. Les reports `0x01` et `0x02` de la même
+interface portent les boutons du casque, en HID standard (voir §7).
 
 | ID | Sens | Nom | Usage |
 |---|---|---|---|
@@ -281,3 +283,125 @@ entend la bascule dans le casque.
 Dans Shokz Connect, le changement de langue passe par une fenêtre de progression
 (`LanguageUpdateProgressAlertView`). Il semble donc téléverser un pack d'invites vocales.
 freeShokz s'abstient tant que ce n'est pas mieux compris.
+
+---
+
+## 7. Boutons du casque (HID standard)
+
+Les boutons ne passent **pas** par le protocole vendeur : aucune notification `0x13`/`0x15`, rien
+sur l'interface 1. Ils arrivent en HID Consumer / Telephony classique sur l'interface 0
+(endpoint `0x81`), que le noyau expose en deux devices evdev : `Shokz Loop120 by Shokz Consumer
+Control` (report `0x01`) et `Shokz Loop120 by Shokz` (report `0x02`). ✅
+
+Ce que produit un bouton dépend de l'état audio de la carte son du dongle (voir le tableau
+« Rôle des boutons ») :
+
+- **aucun flux** : une capture `usbmon` ne montre aucun trafic à l'appui, le casque traite les
+  boutons en local ; ✅
+- **lecture seule** (musique) : mode média ; ✅
+- **capture ouverte** (micro utilisé) : mode communication ; ✅
+- **appel** : l'hôte a posé la LED Off-Hook. ✅
+
+Le test « capture ouverte » a été fait avec lecture et capture simultanées. Que la capture seule
+suffise à basculer en mode communication est une hypothèse.
+
+### Report `0x01` : Consumer, entrée (2 octets)
+
+| Octet | bit 0 | bit 1 | bit 2 | bit 3 | bit 4 | bit 5 | bit 6 | bit 7 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | **Play/Pause `CD`** ✅ | Next `B5` | Prev `B6` | Stop `B7` | Play `B0` | Pause `B1` | FF `B3` | Rewind `B4` |
+| 2 | **Vol+ `E9`** ✅ | **Vol− `EA`** ✅ | Mute `E2` (relatif) | — | — | — | — | — |
+
+Un appui envoie l'usage à 1 puis un report vide (relâché). Par exemple Vol+ : `01 00 01` puis
+`01 00 00`, et Play/Pause : `01 01 00` puis `01 00 00`.
+
+### Report `0x02` : Telephony, entrée (2 octets)
+
+| bit | Usage | Type |
+|---|---|---|
+| 0 | Phone Mute `0x0B:2F` ✅ | relatif : impulsion de bascule, pas un état |
+| 1 | Hook Switch `0x0B:20` ✅ | absolu : 1 = décroché |
+| 2 | Flash `0x0B:21` | absolu |
+| 3 | Programmable Button / Button 1 | |
+
+### Report `0x02` : LED, sortie (2 octets)
+
+Écrit par l'hôte (softphone) pour signaler l'état d'appel, par `write()` sur le hidraw (le noyau
+l'envoie en `SET_REPORT`).
+
+| bit | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| Usage | **Off-Hook** `08:17` ✅ | Speaker `08:1E` | Mute `08:09` | Ring `08:18` | Hold `08:20` | Microphone `08:21` | On-Line `08:2A` | Ringer `0B:9E` |
+
+Le 2ᵉ octet est du bourrage. `02 01 00` = appel en cours, `02 00 00` = raccroché.
+
+**LED Mute : le dongle ne réagit qu'aux changements.** ✅ Le dongle mémorise la dernière valeur
+écrite par l'hôte :
+
+- si le bit Mute change par rapport à cette valeur, le dongle impose ce même état au casque :
+  0 → 1 coupe le micro (« Mute on », LED rouge), 1 → 0 le rétablit. Si le casque est déjà dans
+  cet état, rien ne se passe, sans invite ;
+- si l'hôte réécrit la même valeur, le dongle ne fait rien, même si le casque a changé d'état
+  entre-temps avec la perche ;
+- quand c'est l'hôte qui change le mute, le casque n'envoie **aucune** impulsion Phone Mute en
+  retour, donc pas de risque de boucle.
+
+C'est ce qui permet à l'hôte de rester maître de l'état : après chaque impulsion de la perche, il
+réécrit la LED Mute qui correspond à ce qu'il croit, et le casque s'aligne dessus.
+Pour imposer un état sans connaître la valeur mémorisée, il faut écrire la valeur opposée puis
+la valeur voulue (`02 00 00` puis `02 04 00` garantit un micro coupé).
+
+### LED du dongle ✅
+
+| Couleur | État |
+|---|---|
+| Bleu | par défaut |
+| Vert | micro utilisé (flux de capture ouvert sur la carte son du dongle) |
+| Rouge | micro coupé par la perche, flux de capture ouvert |
+
+La LED ne dépend pas de l'hôte. Pendant un appel Teams (PWA Chrome), aucun report HID n'a été
+envoyé au dongle, et la LED est passée au vert au démarrage du flux de capture. Elle est passée au
+rouge au mute par la perche. L'effet propre de la LED Off-Hook sur la couleur n'est pas isolé :
+pendant l'appel simulé, la capture était aussi ouverte.
+
+### Rôle des boutons ✅
+
+| Bouton | Aucun flux | Lecture seule (musique) | Capture ouverte, pas d'appel | Appel en cours (Off-Hook posé) |
+|---|---|---|---|---|
+| Volume + (et marche/arrêt) | local | Vol+ → `KEY_VOLUMEUP` | idem | idem |
+| Volume − | local | Vol− → `KEY_VOLUMEDOWN` | idem | idem |
+| Perche micro | local | rien vers le PC | mute local + invite + LED rouge + impulsion Mute → `KEY_MICMUTE` | **mute local du micro** + invite « Mute on/off » + impulsion Mute |
+| Côté du casque | local | **Play/Pause** → `KEY_PLAYPAUSE` | `02 00` (Hook reste à 0, aucun event evdev) | **raccrocher** : Hook 1 → 0, bip |
+
+Détails observés :
+
+- **Volume** : le casque ne règle rien lui-même, l'hôte ajuste le sink puis PipeWire écrit le volume
+  matériel du dongle (`SET_CUR` sur la carte son).
+- **Play/Pause** : sous GNOME, `KEY_PLAYPAUSE` est relayé en MPRIS (testé avec Deezer dans
+  Firefox). La reprise a fonctionné 20 s après la pause. On ne sait pas si le flux USB était
+  encore ouvert à ce moment-là.
+- **Mute** : le micro est coupé dans le casque, avant l'USB (la capture tombe au zéro numérique
+  entre les deux appuis). L'hôte ne reçoit qu'une impulsion, identique pour activer et désactiver.
+  Sous Linux, `KEY_MICMUTE` agit sur la *source par défaut* du bureau, qui n'est pas forcément le
+  dongle : l'état vu par le bureau peut diverger de celui du casque.
+- **État du mute illisible** : aucun `get` du dongle (`0x01`–`0x10`) ni du casque
+  (`0x10`, `0x14`, `0x15`, `0x19`, `0x1E`, `0x74`), ni le `Headset Capture Switch` ALSA, ne
+  change entre micro actif et micro coupé. ✅ La seule façon de le connaître est de compter les
+  impulsions, ou de l'imposer par la LED Mute.
+- **Fermeture du micro** : quand la capture se ferme (PipeWire ferme le PCM quelques secondes
+  après le dernier client), le casque rétablit son micro sans invite et la LED repasse au bleu. ✅
+- **Hook Switch** : le noyau ne le traduit en aucune touche evdev. Il faut lire le report `0x02`
+  sur le hidraw.
+- **Entrée en appel** : dès que l'hôte pose Off-Hook, le casque répond `02 02` (Hook = 1), puis
+  envoie de lui-même deux Vol+.
+- **Raccrocher** : le casque envoie `02 00`. Si l'hôte ne remet pas la LED Off-Hook à 0, le
+  casque repasse à `02 02` environ 2 s plus tard.
+- **Distinguer les boutons en mode communication** : l'impulsion Mute est `02 01` suivi ~8 ms plus
+  tard de `02 00`. Un `02 00` isolé, sans `02 01` juste avant, vient du bouton de côté.
+- Un appui sur Vol− a produit deux événements à 26 ms d'écart (rebond ou doublon du firmware).
+- **Teams (PWA Chrome, Linux)** n'envoie aucun report HID au dongle : pas d'Off-Hook, pas de LED
+  Mute. Le bouton mute de Teams n'agit que dans l'appli, et Teams ne voit ni le mute du casque ni
+  le bouton de côté.
+- **GNOME** traite `KEY_MICMUTE` en mettant en muet la source par défaut. Si ce n'est pas le
+  dongle, c'est le mauvais micro qui est coupé (observé : micro interne mis en muet).
+- L'appel entrant (LED Ring, décrochage par le bouton de côté) n'a pas été testé.

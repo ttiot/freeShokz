@@ -28,6 +28,9 @@ def gauge(level: int) -> str:
 
 
 SLASH = '<path d="M1.5 1.5l13 13" stroke="#2e3436" stroke-width="1.6" stroke-linecap="round"/>'
+# micro coupé : barre pleine (pas un trait) pour que la recoloration symbolique .error s'applique
+MUTED = ('<rect x="-0.5" y="7.1" width="17" height="1.8" rx="0.9" transform="rotate(45 8 8)"'
+         ' class="error" fill="#cc0000"/>')
 
 APP_ICON = """<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
 <defs>
@@ -60,6 +63,8 @@ def main():
     for level in range(0, 101, 10):
         (status / f"shokz-tray-hc-{level:03d}-symbolic.svg").write_text(
             SYMBOLIC.format(dim="", extra=gauge(level)))
+        (status / f"shokz-tray-hc-{level:03d}-muted-symbolic.svg").write_text(
+            SYMBOLIC.format(dim="", extra=gauge(level) + MUTED))
     (status / "shokz-tray-hc-disconnected-symbolic.svg").write_text(
         SYMBOLIC.format(dim=' opacity="0.45"', extra=""))
     (status / "shokz-tray-hc-nodongle-symbolic.svg").write_text(

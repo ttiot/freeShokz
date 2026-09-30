@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # freeShokz — accès utilisateur au dongle Shokz Loop120
 #
-# Seule l'interface 0 (usage page Consumer, reports de commande 0x10-0x17) est ouverte à la
-# session active (TAG uaccess -> ACL). L'interface 1 (usage page vendeur 0xFF00, utilisée pour
-# les mises à jour firmware / DFU) reste réservée à root : freeShokz n'y écrit jamais.
+# Seule l'interface 0 est ouverte à la session active (TAG uaccess -> ACL) :
+#   - son hidraw : usage page Consumer, reports de commande 0x10-0x17 et boutons 0x01/0x02 ;
+#   - ses devices evdev (touches média, KEY_MICMUTE) : shokz-tray prend l'exclusivité du device
+#     Telephony pour que GNOME ne coupe pas la source par défaut, qui n'est pas forcément le
+#     dongle, quand on appuie sur le bouton de la perche (le casque coupe déjà son micro).
+# L'interface 1 (usage page vendeur 0xFF00, mises à jour firmware / DFU) reste réservée à root :
+# freeShokz n'y écrit jamais.
 #
 # Tous les ATTRS{} d'une règle doivent correspondre sur un même parent : idVendor (périphérique
 # USB) et bInterfaceNumber (interface) ne peuvent donc pas être combinés. On importe usb_id, qui
@@ -12,7 +16,7 @@
 # 3511:2ef2 = Loop120 USB-A (testé) ; 3511:2f06 = Loop120 USB-C (non testé, même protocole)
 # (pas de ATTRS{}!= : la négation est vraie dès qu'un parent, le hub par exemple, diffère)
 ACTION=="remove", GOTO="shokz_loop120_end"
-SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="3511", GOTO="shokz_loop120"
+SUBSYSTEM=="hidraw|input", KERNEL=="hidraw*|event*", ATTRS{idVendor}=="3511", GOTO="shokz_loop120"
 GOTO="shokz_loop120_end"
 
 LABEL="shokz_loop120"
@@ -20,6 +24,7 @@ ENV{ID_USB_INTERFACE_NUM}!="?*", IMPORT{builtin}="usb_id"
 ENV{ID_USB_MODEL_ID}!="2ef2|2f06", GOTO="shokz_loop120_end"
 ENV{ID_USB_INTERFACE_NUM}!="00", GOTO="shokz_loop120_end"
 
-TAG+="uaccess", MODE="0660", GROUP="plugdev"
+TAG+="uaccess"
+SUBSYSTEM=="hidraw", MODE="0660", GROUP="plugdev"
 
 LABEL="shokz_loop120_end"

@@ -12,6 +12,7 @@ Un seul process :
   * Fenêtre Adw : bandeau produit, jauge batterie, bascule EQ, appareils, informations.
 """
 import copy
+import fcntl
 import logging
 import math
 import os
@@ -48,6 +49,10 @@ LOW_BATTERY_STEPS = (20, 10)
 SHOW_LABEL = os.environ.get("SHOKZ_TRAY_LABEL") == "1"
 # Masque adresses et noms d'appareils tiers (captures d'écran publiables)
 ANONYMIZE = os.environ.get("SHOKZ_TRAY_ANONYMIZE") == "1"
+# Synchronisation du micro : exclusivité sur KEY_MICMUTE (MicMuteGrab) et écriture de la LED
+# Mute du dongle (DeviceWorker._sync_mute). À couper si un softphone pilote déjà le casque en HID.
+MIC_SYNC = os.environ.get("SHOKZ_TRAY_MIC_SYNC", "1") != "0"
+EVIOCGRAB = 0x40044590  # _IOW('E', 0x90, int)
 
 
 def _ensure_icons():
@@ -81,6 +86,7 @@ class DeviceWorker(threading.Thread):
 
     RETRY = 4.0          # s entre deux tentatives (dongle absent, casque éteint)
     POLL_BATTERY = 60.0  # s entre deux lectures batterie (en plus des notifications)
+    MUTE_DEBOUNCE = 0.2  # s : le firmware double parfois un événement (vu sur Vol−)
 
     # notification sync du casque -> paramètres à relire
     SYNC_REFRESH = {"battery": {"battery"}, "charging": {"battery"}, "eq": {"eq"},
@@ -96,10 +102,18 @@ class DeviceWorker(threading.Thread):
         self._dirty: set[str] = set()
         self._recheck = False
         self._next_poll = 0.0
+        self._capture_files: list[Path] = []
+        self._mute_bit = 0
+        self._last_mute = 0.0
+        self._host_mute: bool | None = None  # dernière LED Mute écrite (None : inconnue)
+        self._mic_synced = False  # état initial du mute imposé depuis l'ouverture du dongle
 
     # --- API thread-safe (appelée depuis GTK) ---------------------------------
     def request_eq(self, mode: str):
         self.cmds.put(("eq", mode))
+
+    def request_mute_toggle(self):
+        self.cmds.put(("mute", None))
 
     def request_refresh(self):
         self.cmds.put(("refresh", None))
@@ -110,7 +124,9 @@ class DeviceWorker(threading.Thread):
     # --- publication ------------------------------------------------------
     @staticmethod
     def _blank():
-        return {"state": "no_dongle", "detail": "", "dongle": {}, "headset": {}, "updated": None}
+        # mic : état du micro du casque, reconstitué (le casque ne l'expose pas, cf. _on_hid)
+        return {"state": "no_dongle", "detail": "", "dongle": {}, "headset": {},
+                "mic": {"open": False, "muted": False}, "updated": None}
 
     def _post(self):
         if self.st != self._posted:
@@ -147,6 +163,7 @@ class DeviceWorker(threading.Thread):
                     self._idle(self.RETRY * 3)
                 except sz.ShokzError as e:
                     # dongle présent mais casque injoignable (éteint, hors de portée, SPP refusé)
+                    self.st["mic"]["muted"] = False
                     self._set_state("no_headset", str(e))
                     self._idle(self.RETRY)
                 except _Quit:
@@ -174,6 +191,7 @@ class DeviceWorker(threading.Thread):
         if time.monotonic() >= self._next_poll:
             self._next_poll = time.monotonic() + self.POLL_BATTERY
             self._refresh({"battery"})
+        self._poll_mic()
         self._pump(1.0)
 
     def _idle(self, timeout: float):
@@ -199,8 +217,16 @@ class DeviceWorker(threading.Thread):
         path = sz.find_hidraw()
         self.dev = sz.Loop120(path)
         self.dev.on_message = self._on_message
+        self.dev.on_hid = self._on_hid
+        self._host_mute, self._mic_synced = None, False
+        try:
+            self._capture_files = sz.capture_status_files(path)
+        except OSError as e:
+            log.warning("carte son du dongle introuvable, suivi du micro limité : %s", e)
+            self._capture_files = []
         d = self.dev
         self.st["dongle"] = {
+            "hidraw": path,
             "model": sz.dongle_model(path),
             "version": sz.cstr(d.dongle_get(sz.DG_VERSION)),
             "address": sz.bt_addr(d.dongle_get(sz.DG_BT_ADDRESS)),
@@ -229,6 +255,8 @@ class DeviceWorker(threading.Thread):
         d.ensure_spp()
         self._refresh(set(sz.SUPPORTED_C120))
         self._next_poll = time.monotonic() + self.POLL_BATTERY
+        if not self._mic_synced:
+            self._initial_mute()
         self._set_state("ready")
 
     def _refresh(self, names: set[str]):
@@ -265,6 +293,86 @@ class DeviceWorker(threading.Thread):
         elif rep == sz.REPORT_FROM_DONGLE and t1 == sz.D_SYNC and t2 in (0x01, sz.DY_SPP_STATUS):
             self._recheck = True  # connexion BT ou canal SPP modifié : on revalide la session
 
+    # --- micro ----------------------------------------------------------------
+    # Le casque n'expose pas son état de mute. La perche le fait basculer et n'envoie qu'une
+    # impulsion Phone Mute (identique dans les deux sens), seulement micro ouvert ; il se
+    # rétablit seul à la fermeture de la capture. En revanche, un changement de la LED Mute écrite
+    # par l'hôte lui impose l'état, sans invite s'il y est déjà. Le tray tient donc l'état de
+    # référence et le réécrit après chaque changement : une impulsion ratée est corrigée au
+    # prochain appui au lieu de laisser l'affichage inversé jusqu'à la fin de l'appel.
+    def _write_mute(self, muted: bool):
+        self.dev.set_telephony_leds(sz.LED_MUTE if muted else 0)
+        self._host_mute = muted
+
+    def _sync_mute(self):
+        """Aligne la LED Mute du dongle sur l'état du tray (silencieux si le casque y est déjà)."""
+        if MIC_SYNC and self._host_mute != self.st["mic"]["muted"]:
+            self._write_mute(self.st["mic"]["muted"])
+
+    def _initial_mute(self):
+        mic = self.st["mic"]
+        mic["open"] = sz.capture_open(self._capture_files)
+        mic["muted"] = False
+        if MIC_SYNC and mic["open"]:
+            # tray lancé en plein appel : état du casque inconnu. On coupe, dans le doute. Deux
+            # écritures, car seule une transition agit et la valeur mémorisée par le dongle est
+            # inconnue.
+            log.info("capture déjà ouverte : micro du casque coupé par précaution")
+            self._write_mute(False)
+            self._write_mute(True)
+            mic["muted"] = True
+        else:
+            self._sync_mute()
+        self._mic_synced = True
+
+    def _set_mute(self, muted: bool):
+        mic = self.st["mic"]
+        if not mic["open"]:
+            self._event(False, "Micro du casque non utilisé")
+            return
+        if not MIC_SYNC:
+            self._event(False, "Synchronisation du micro désactivée (SHOKZ_TRAY_MIC_SYNC=0)")
+            return
+        mic["muted"] = muted
+        self._sync_mute()
+        log.info("micro du casque %s depuis le tray", "coupé" if muted else "rétabli")
+        self._post()
+
+    def _on_hid(self, rep, data):
+        """Impulsion Phone Mute de la perche (report 0x02, bit 0)."""
+        if rep != sz.REPORT_TELEPHONY or not data:
+            return
+        bit = data[0] & sz.TEL_MUTE
+        rising, self._mute_bit = bit and not self._mute_bit, bit
+        if not rising:
+            return
+        now = time.monotonic()
+        if now - self._last_mute < self.MUTE_DEBOUNCE:
+            log.debug("impulsion mute ignorée (rebond)")
+            return
+        self._last_mute = now
+        mic = self.st["mic"]
+        mic["open"] = True  # l'impulsion n'existe que micro ouvert, même si _poll_mic n'a pas vu
+        mic["muted"] = not mic["muted"]
+        log.info("micro du casque %s", "coupé" if mic["muted"] else "rétabli")
+        self._sync_mute()
+        self._post()
+
+    def _poll_mic(self):
+        mic = self.st["mic"]
+        is_open = sz.capture_open(self._capture_files)
+        if is_open == mic["open"]:
+            return
+        mic["open"] = is_open
+        if not is_open and mic["muted"]:
+            # constaté : le casque rétablit son micro (sans invite) quand la capture se ferme
+            log.info("capture fermée : micro du casque rétabli")
+            mic["muted"] = False
+        if not is_open:
+            self._host_mute = None  # on ne sait pas si le dongle oublie aussi la LED : on réécrit
+            self._sync_mute()
+        self._post()
+
     def _process_cmds(self):
         while True:
             try:
@@ -275,7 +383,12 @@ class DeviceWorker(threading.Thread):
     def _handle_cmd(self, cmd, arg):
         if cmd == "quit":
             raise _Quit
-        if cmd == "refresh":
+        if cmd == "mute":
+            if self.st["state"] != "ready" or self.dev is None:
+                self._event(False, "Casque non connecté")
+                return
+            self._set_mute(not self.st["mic"]["muted"])
+        elif cmd == "refresh":
             if self.st["state"] == "ready":
                 self._dirty |= set(sz.SUPPORTED_C120)
             self._recheck = True
@@ -291,6 +404,69 @@ class DeviceWorker(threading.Thread):
                 log.warning("changement d'EQ refusé : %s", e)
                 self._event(False, "Le casque a refusé le changement d'égaliseur")
                 self._dirty.add("eq")
+
+
+class MicMuteGrab:
+    """Prend l'exclusivité (EVIOCGRAB) du device evdev Telephony du dongle.
+
+    Sans ça, GNOME traduit l'impulsion de la perche (KEY_MICMUTE) en mute de la source par
+    défaut, qui n'est pas forcément le dongle : on couperait un autre micro, alors que le casque
+    a déjà coupé le sien. Le hidraw, lu par DeviceWorker, reçoit toujours le report.
+    Vit dans la boucle GTK (GLib.unix_fd_add_full)."""
+
+    def __init__(self):
+        self.fd: int | None = None
+        self.watch = 0
+        self.failed: str | None = None  # dernier device refusé : on ne réessaie pas en boucle
+
+    def ensure(self, hidraw: str | None):
+        if self.fd is not None or not hidraw:
+            return
+        try:
+            path = sz.telephony_evdev(hidraw)
+        except OSError as e:
+            log.warning("recherche du device evdev du dongle impossible : %s", e)
+            return
+        if path is None or path == self.failed:
+            return
+        fd = None
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            fcntl.ioctl(fd, EVIOCGRAB, 1)
+        except OSError as e:
+            if fd is not None:
+                os.close(fd)
+            self.failed = path
+            log.warning("exclusivité sur %s impossible (%s) : le bouton de la perche coupera "
+                        "aussi le micro par défaut de GNOME (règle udev à jour ?)", path, e.strerror)
+            return
+        self.fd, self.failed = fd, None
+        self.watch = GLib.unix_fd_add_full(GLib.PRIORITY_DEFAULT, fd,
+                                           GLib.IOCondition.IN | GLib.IOCondition.HUP
+                                           | GLib.IOCondition.ERR, self._drain)
+        log.info("KEY_MICMUTE du dongle intercepté (%s)", path)
+
+    def _drain(self, fd, cond):
+        if not cond & (GLib.IOCondition.HUP | GLib.IOCondition.ERR):
+            try:
+                os.read(fd, 4096)  # on jette : l'état vient du hidraw
+                return True
+            except BlockingIOError:
+                return True
+            except OSError:
+                pass
+        log.info("device evdev du dongle fermé")
+        self.watch = 0  # source retirée par le False retourné
+        self.close()
+        return False
+
+    def close(self):
+        if self.watch:
+            GLib.source_remove(self.watch)
+            self.watch = 0
+        if self.fd is not None:
+            os.close(self.fd)  # libère aussi l'exclusivité
+            self.fd = None
 
 
 # ---------------------------------------------------------------------------
@@ -793,12 +969,19 @@ class MainWindow(Adw.ApplicationWindow):
         self.stack.set_visible_child_name("main")
 
         self.hero_title.set_label("OpenComm2")
-        self.pill.set_label("● Connecté via Loop120")
+        mic = st["mic"]
+        if mic["muted"]:
+            pill, cls = "● Micro coupé", "warn"
+        elif mic["open"]:
+            pill, cls = "● Micro actif", "ok"
+        else:
+            pill, cls = "● Connecté via Loop120", "ok"
+        self.pill.set_label(pill)
         if ANONYMIZE:
             h, d = _anonymize(h), _anonymize(d)
         for c in ("ok", "warn", "off"):
             self.pill.remove_css_class(c)
-        self.pill.add_css_class("ok")
+        self.pill.add_css_class(cls)
 
         self.ring.set_level(h.get("battery"))
         eq = h.get("eq")
@@ -874,6 +1057,7 @@ class MainWindow(Adw.ApplicationWindow):
 # Application
 # ---------------------------------------------------------------------------
 MENU_HEADER, MENU_EQ_STD, MENU_EQ_VOC, MENU_OPEN, MENU_REFRESH, MENU_QUIT = 1, 3, 4, 6, 7, 8
+MENU_MUTE = 10
 
 
 class ShokzTrayApp(Adw.Application):
@@ -887,6 +1071,7 @@ class ShokzTrayApp(Adw.Application):
         self.window: MainWindow | None = None
         self.tray: TrayIcon | None = None
         self.worker: DeviceWorker | None = None
+        self.grab = MicMuteGrab() if MIC_SYNC else None
         self.state = DeviceWorker._blank()
         self._low_notified = 101  # dernier palier de batterie faible notifié
         self._first_activate = True
@@ -952,6 +1137,8 @@ class ShokzTrayApp(Adw.Application):
         log.info("arrêt demandé")
         self.worker.shutdown()
         self.worker.join(timeout=3)
+        if self.grab:
+            self.grab.close()
         if self.tray:
             self.tray.close()
         self.release()
@@ -960,6 +1147,9 @@ class ShokzTrayApp(Adw.Application):
     # --- retours du worker ------------------------------------------------
     def _on_state(self, st):
         self.state = st
+        log.debug("état reçu : %s mic=%s", st["state"], st["mic"])
+        if self.grab and st["state"] == "ready":
+            self.grab.ensure(st["dongle"].get("hidraw"))
         self.window.render(st)
         snap = os.environ.get("SHOKZ_TRAY_SNAPSHOT")  # debug : rendu PNG de la fenêtre
         if snap and st["state"] == "ready" and not getattr(self, "_snapped", False):
@@ -1004,7 +1194,7 @@ class ShokzTrayApp(Adw.Application):
     def _update_tray(self):
         if not self.tray:
             return
-        st, h = self.state, self.state["headset"]
+        st, h, mic = self.state, self.state["headset"], self.state["mic"]
         ready = st["state"] == "ready"
         bat, eq = h.get("battery"), h.get("eq")
         if st["state"] in ("no_dongle", "no_access"):
@@ -1012,7 +1202,8 @@ class ShokzTrayApp(Adw.Application):
         elif not ready or bat is None:
             icon = "shokz-tray-hc-disconnected-symbolic"
         else:
-            icon = f"shokz-tray-hc-{min(100, max(0, round(bat / 10) * 10)):03d}-symbolic"
+            muted = "-muted" if mic["muted"] else ""
+            icon = f"shokz-tray-hc-{min(100, max(0, round(bat / 10) * 10)):03d}{muted}-symbolic"
         header = {
             "ready": f"OpenComm2 · {bat} %" if bat is not None else "OpenComm2",
             "connecting": "Connexion au casque…",
@@ -1020,10 +1211,15 @@ class ShokzTrayApp(Adw.Application):
             "no_dongle": "Dongle Loop120 absent",
             "no_access": "Accès au dongle refusé",
         }.get(st["state"], "Shokz")
+        if ready and mic["muted"]:
+            header += " · micro coupé"
         tooltip = header + (f"\nÉgaliseur : {EQ_LABELS.get(eq, '—')}" if ready else "")
         items = [
             (MENU_HEADER, {"label": header, "enabled": False}),
             (2, {"type": "separator"}),
+            (MENU_MUTE, {"label": "Rétablir le micro" if mic["muted"] else "Couper le micro",
+                         "enabled": ready and mic["open"] and MIC_SYNC}),
+            (9, {"type": "separator"}),
             (MENU_EQ_STD, {"label": "Égaliseur standard", "toggle-type": "radio",
                            "toggle-state": int(ready and eq == "standard"), "enabled": ready}),
             (MENU_EQ_VOC, {"label": "Égaliseur voix renforcée", "toggle-type": "radio",
@@ -1037,7 +1233,9 @@ class ShokzTrayApp(Adw.Application):
                          "Shokz OpenComm2", tooltip, items)
 
     def _on_menu(self, item_id):
-        if item_id == MENU_EQ_STD:
+        if item_id == MENU_MUTE:
+            self.worker.request_mute_toggle()
+        elif item_id == MENU_EQ_STD:
             self.worker.request_eq("standard")
         elif item_id == MENU_EQ_VOC:
             self.worker.request_eq("vocal")

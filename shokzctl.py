@@ -67,6 +67,12 @@ EQ_MODES = ["standard", "vocal", "bass_boost", "treble_boost", "custom1", "custo
 EQ_USER_MODES = ("standard", "vocal")  # seuls modes exposés par Shokz Connect pour l'OpenComm2
 SET_HEADSET_EQ = 0x0E  # PcSetComm3_Tag2.setHeadsetEQ
 
+# Boutons : HID standard sur la même interface (docs/PROTOCOL.md §7)
+REPORT_CONSUMER, REPORT_TELEPHONY = 0x01, 0x02
+TEL_MUTE, TEL_HOOK = 0x01, 0x02  # bits du 1er octet du report 0x02 (Phone Mute, Hook Switch)
+LED_OFF_HOOK, LED_MUTE = 0x01, 0x04  # bits du 1er octet du report 0x02 en sortie (LED)
+KEY_MICMUTE = 248  # linux/input-event-codes.h
+
 
 class ShokzError(Exception):
     pass
@@ -151,6 +157,43 @@ def dongle_model(path: str) -> str:
     return DONGLE_MODELS.get(pid, "Loop120")
 
 
+def _hid_device(path: str) -> Path:
+    """Nœud sysfs du périphérique HID (…/3-4.1:1.0/0003:3511:2EF2.xxxx) derrière un hidraw."""
+    return (Path("/sys/class/hidraw") / Path(path).name / "device").resolve()
+
+
+def capture_status_files(path: str) -> list[Path]:
+    """Fichiers /proc/asound/cardN/pcm*c/sub*/status de la carte son du même dongle."""
+    usb = _hid_device(path).parent.parent
+    files = []
+    for card in usb.glob("*/sound/card*"):
+        num = (card / "number").read_text().strip()
+        files += sorted(Path(f"/proc/asound/card{num}").glob("pcm*c/sub*/status"))
+    return files
+
+
+def capture_open(files: list[Path]) -> bool:
+    """Vrai si un flux de capture (micro) est ouvert sur la carte son du dongle."""
+    for f in files:
+        try:
+            if f.read_text().strip() != "closed":
+                return True
+        except OSError:  # carte disparue
+            pass
+    return False
+
+
+def telephony_evdev(path: str) -> str | None:
+    """Device evdev du dongle qui porte KEY_MICMUTE (collection Telephony du report 0x02)."""
+    for inp in sorted(_hid_device(path).glob("input/input*")):
+        words = (inp / "capabilities" / "key").read_text().split()
+        bits = int("".join(w.zfill(16) for w in words), 16)  # mots de 64 bits, poids fort d'abord
+        if bits >> KEY_MICMUTE & 1:
+            for ev in inp.glob("event*"):
+                return f"/dev/input/{ev.name}"
+    return None
+
+
 class Loop120:
     """Transport HID vers le dongle (reports 0x12/0x13) et le casque via SPP (0x14/0x15)."""
 
@@ -166,6 +209,8 @@ class Loop120:
         # appelé avec (report, tag1, tag2, value) pour tout message non corrélé à une requête
         # (notifications sync du casque/dongle) ; sinon ces messages sont ignorés
         self.on_message = None
+        # appelé avec (report, data) pour les reports boutons 0x01/0x02 (HID standard)
+        self.on_hid = None
         log.debug("ouvert %s", self.path)
 
     def close(self):
@@ -198,6 +243,11 @@ class Loop120:
                 continue
             if not data:  # lisible mais vide : le périphérique a disparu
                 raise OSError(errno.ENODEV, "dongle déconnecté")
+            if data[0] in (REPORT_CONSUMER, REPORT_TELEPHONY):
+                log.debug("HID %s", data.hex(" "))
+                if self.on_hid:
+                    self.on_hid(data[0], data[1:])
+                continue
             if data[0] not in reports:
                 continue
             log.debug("RX %s", data.rstrip(b"\x00").hex(" "))
@@ -216,6 +266,13 @@ class Loop120:
                 return val
             self._dispatch(msg)
         raise ShokzError(f"pas de réponse (tag1={tag1:#x} tag2={tag2:#x})")
+
+    def set_telephony_leds(self, bits: int):
+        """Output report LED 0x02. Le dongle n'agit que sur un changement de valeur : un
+        passage de LED_MUTE impose le mute du casque (§7 de docs/PROTOCOL.md)."""
+        pkt = bytes([REPORT_TELEPHONY, bits & 0xFF, 0])
+        log.debug("TX %s", pkt.hex(" "))
+        os.write(self.fd, pkt)
 
     # --- dongle -----------------------------------------------------------
     def dongle_get(self, tag2: int, value: bytes = b"") -> bytes:
@@ -380,6 +437,8 @@ def main():
             return 0
         if args.cmd == "listen":
             print("Ctrl-C pour quitter")
+            dev.on_hid = lambda rep, d: print(
+                f"{time.strftime('%H:%M:%S')} bouton report {rep:#04x}: {d[:2].hex(' ')}")
             while True:
                 for rep, t1, t2, val in dev.recv(3600):
                     src = "casque" if rep == REPORT_FROM_HCVA else "dongle"
