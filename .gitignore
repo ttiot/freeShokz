@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# généré par assets/make_icons.py (lancé automatiquement par install.sh)
+assets/icons/

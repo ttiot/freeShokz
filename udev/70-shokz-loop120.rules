@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# freeShokz — accès utilisateur au dongle Shokz Loop120
+#
+# Seule l'interface 0 (usage page Consumer, reports de commande 0x10-0x17) est ouverte à la
+# session active (TAG uaccess -> ACL). L'interface 1 (usage page vendeur 0xFF00, utilisée pour
+# les mises à jour firmware / DFU) reste réservée à root : freeShokz n'y écrit jamais.
+#
+# 3511:2ef2 = Loop120 USB-A (testé) ; 3511:2f06 = Loop120 USB-C (non testé, même protocole)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3511", ATTRS{idProduct}=="2ef2", ATTRS{bInterfaceNumber}=="00", TAG+="uaccess", MODE="0660", GROUP="plugdev"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3511", ATTRS{idProduct}=="2f06", ATTRS{bInterfaceNumber}=="00", TAG+="uaccess", MODE="0660", GROUP="plugdev"
